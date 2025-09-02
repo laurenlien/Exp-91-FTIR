@@ -1,0 +1,354 @@
+# =========================================================
+# FTIR Cross-Instrument Comparison Pipeline (KBr/LN-MCT-B [Agilent] vs ZnSe/TE-MCT-A [Bruker])
+# Author: Lauren Lien
+# Last updated: 2025-09-02
+# =========================================================
+
+# ------------------------
+# Load packages
+# ------------------------
+suppressPackageStartupMessages({
+  library(readxl)
+  library(tidyverse)  # dplyr, tidyr, purrr, stringr, readr, tibble, ggplot2
+  library(janitor)
+  library(vegan)      # adonis2, vegdist
+  library(ggplot2)
+})
+
+# ------------------------
+# Paths
+# ------------------------
+folders <- list(
+  agilent_kkt = "folder location",
+  agilent_raw = "folder location",
+  bruker_kkt  = "folder location",
+  bruker_raw  = "folder location"
+)
+
+metadata_path <- "C:/Users/L.Lien/OneDrive - Universite de Liege/Documents/LLien PhD/Exp 91 stats"
+metadata_file <- file.path(metadata_path, "exp 91 metadata.xlsx")
+
+# ------------------------
+# Helpers
+# ------------------------
+
+# Clean sample IDs to a tidy, comparable form
+clean_sample_id <- function(x) {
+  x %>%
+    tolower() %>%
+    str_replace_all("[^a-z0-9]+", "_") %>%
+    str_replace_all("_+", "_") %>%
+    str_replace_all("_$", "")
+}
+
+# Create a MatchID by taking the first n tokens of the cleaned ID (pairs across machines/runs)
+get_match_id <- function(x, n = 5) {
+  parts <- str_split(x, "_", simplify = TRUE)
+  if (ncol(parts) == 0) return(x)
+  parts[, seq_len(min(n, ncol(parts))), drop = FALSE] %>%
+    as.vector() %>%
+    paste(collapse = "_")
+}
+
+# Safe cosine similarity for numeric vectors
+cosine_vec <- function(x, y) {
+  x <- as.numeric(x); y <- as.numeric(y)
+  num <- sum(x * y, na.rm = TRUE)
+  den <- sqrt(sum(x^2, na.rm = TRUE)) * sqrt(sum(y^2, na.rm = TRUE))
+  if (!is.finite(den) || den == 0) return(NA_real_)
+  num / den
+}
+
+# ------------------------
+# Read a folder of spectra (.xls), infer wavenumber/absorbance cols, and annotate
+# ------------------------
+read_spectrum_folder <- function(path, machine, type) {
+  if (!dir.exists(path)) {
+    message("Folder does not exist, skipping: ", path)
+    return(tibble())
+  }
+
+  files <- list.files(path, pattern = "\\.xls$", full.names = TRUE)
+  if (length(files) == 0) {
+    message("No .xls files found in: ", path)
+    return(tibble())
+  }
+
+  spectra <- lapply(files, function(file) {
+    df <- tryCatch(read_excel(file) %>% clean_names(),
+                   error = function(e) { message("Failed to read: ", basename(file)); return(NULL) })
+    if (is.null(df)) return(NULL)
+
+    col_names <- names(df)
+    wave_col <- if ("w" %in% col_names) "w" else if ("c" %in% col_names) "c" else NA
+    abs_col  <- if ("a" %in% col_names) "a" else if ("m" %in% col_names) "m" else NA
+
+    if (is.na(wave_col) || is.na(abs_col)) {
+      message("Skipping (no wavenumber/absorbance): ", basename(file))
+      return(NULL)
+    }
+
+    sample_name <- tools::file_path_sans_ext(basename(file))
+    sample_id   <- clean_sample_id(sample_name)
+    match_id    <- get_match_id(sample_id)
+
+    df %>%
+      rename(wavenumber = all_of(wave_col), absorbance = all_of(abs_col)) %>%
+      mutate(
+        wavenumber = suppressWarnings(as.numeric(wavenumber)),
+        absorbance = suppressWarnings(as.numeric(absorbance)),
+        SampleID   = sample_id,
+        MatchID    = match_id,
+        Machine    = machine,
+        DataType   = type
+      )
+  })
+
+  bind_rows(spectra)
+}
+
+# ------------------------
+# Load & combine spectra
+# ------------------------
+agilent_kkt <- read_spectrum_folder(folders$agilent_kkt, "Agilent", "KKT")
+agilent_raw <- read_spectrum_folder(folders$agilent_raw, "Agilent", "Raw")
+bruker_kkt  <- read_spectrum_folder(folders$bruker_kkt,  "Bruker",  "KKT")
+bruker_raw  <- read_spectrum_folder(folders$bruker_raw,  "Bruker",  "Raw")
+
+all_spectra <- bind_rows(agilent_kkt, agilent_raw, bruker_kkt, bruker_raw) %>%
+  mutate(wavenumber = round(as.numeric(wavenumber), 1)) %>%
+  drop_na(wavenumber, absorbance)
+
+if (nrow(all_spectra) == 0) stop("No spectra found. Check your folders and file formats.")
+
+# ------------------------
+# Load & normalize metadata (optional)
+# ------------------------
+metadata <- tryCatch({
+  read_xlsx(metadata_file) %>%
+    clean_names() %>%
+    mutate(sample_id = clean_sample_id(sample_id))
+}, error = function(e) {
+  message("Could not read metadata file, proceeding without metadata: ", metadata_file)
+  tibble()
+})
+
+# ------------------------
+# Merge spectra + metadata
+# ------------------------
+spectra <- if (nrow(metadata) > 0) {
+  all_spectra %>% left_join(metadata, by = c("SampleID" = "sample_id"))
+} else {
+  all_spectra
+}
+
+# ------------------------
+# Interpolation to common grid
+# ------------------------
+common_grid <- seq(4000, 650, by = -2)
+
+interpolate_spectra <- function(df, machine_label) {
+  if (nrow(df) == 0) return(tibble())
+  df %>%
+    split(.$MatchID) %>%
+    map_dfr(function(sample_df) {
+      match_id <- unique(sample_df$MatchID)[1]
+      sample_id <- unique(sample_df$SampleID)[1]
+
+      # Average duplicates at identical wavenumbers
+      sample_df <- sample_df %>%
+        mutate(
+          wavenumber = readr::parse_number(as.character(wavenumber)),
+          absorbance = readr::parse_number(as.character(absorbance))
+        ) %>%
+        drop_na(wavenumber, absorbance) %>%
+        group_by(wavenumber) %>%
+        summarise(absorbance = mean(absorbance, na.rm = TRUE), .groups = "drop")
+
+      if (nrow(sample_df) < 2) return(tibble())
+
+      interp <- approx(x = sample_df$wavenumber,
+                       y = sample_df$absorbance,
+                       xout = common_grid,
+                       rule = 2)
+
+      tibble(
+        MatchID    = match_id,
+        SampleID   = sample_id,
+        Machine    = machine_label,
+        wavenumber = interp$x,
+        absorbance = interp$y
+      )
+    })
+}
+
+agilent_interp <- spectra %>% filter(Machine == "Agilent") %>% interpolate_spectra("Agilent")
+bruker_interp  <- spectra %>% filter(Machine == "Bruker")  %>% interpolate_spectra("Bruker")
+
+interpolated <- bind_rows(agilent_interp, bruker_interp)
+
+if (nrow(interpolated) == 0) stop("Interpolation produced no rows. Check inputs.")
+
+# ------------------------
+# Prepare paired spectra (wide by Machine)
+# ------------------------
+paired_spectra <- interpolated %>%
+  pivot_wider(names_from = Machine,
+              values_from = absorbance,
+              values_fn = mean,
+              values_fill = NA) %>%
+  mutate(
+    Agilent = as.numeric(Agilent),
+    Bruker  = as.numeric(Bruker)
+  ) %>%
+  drop_na(Agilent, Bruker)
+
+# ------------------------
+# Metrics
+# ------------------------
+metrics <- paired_spectra %>%
+  group_by(MatchID) %>%
+  summarise(
+    valid_pairs = sum(!is.na(Agilent) & !is.na(Bruker)),
+    pearson     = if (valid_pairs > 1) cor(Agilent, Bruker, use = "complete.obs") else NA_real_,
+    cv_agilent  = if (valid_pairs > 1) sd(Agilent, na.rm = TRUE) / mean(Agilent, na.rm = TRUE) else NA_real_,
+    cv_bruker   = if (valid_pairs > 1) sd(Bruker,  na.rm = TRUE) / mean(Bruker,  na.rm = TRUE) else NA_real_,
+    cosine      = if (valid_pairs > 1) cosine_vec(Agilent, Bruker) else NA_real_,
+    .groups = "drop"
+  ) %>%
+  filter(!is.na(pearson))
+
+wilcoxon_results <- paired_spectra %>%
+  group_by(MatchID) %>%
+  summarise(
+    p = tryCatch(wilcox.test(Agilent, Bruker, paired = TRUE)$p.value,
+                 error = function(e) NA_real_)
+  )
+
+bland_altman <- paired_spectra %>%
+  group_by(MatchID) %>%
+  mutate(
+    diff      = Agilent - Bruker,
+    mean_vals = (Agilent + Bruker) / 2
+  ) %>%
+  filter(!is.na(diff) & !is.na(mean_vals))
+
+bland_summary <- bland_altman %>%
+  group_by(MatchID) %>%
+  summarise(
+    ba_mean_diff = mean(diff, na.rm = TRUE),
+    ba_sd_diff   = sd(diff, na.rm = TRUE),
+    ba_upper     = ba_mean_diff + 1.96 * ba_sd_diff,
+    ba_lower     = ba_mean_diff - 1.96 * ba_sd_diff,
+    .groups = "drop"
+  )
+
+# ------------------------
+# PERMANOVA (on interpolated spectral matrix)
+# ------------------------
+spectra_matrix <- interpolated %>%
+  select(SampleID, MatchID, wavenumber, absorbance, Machine) %>%
+  pivot_wider(names_from = wavenumber, values_from = absorbance) %>%
+  column_to_rownames("SampleID")
+
+# Remove constant columns
+constant_cols <- names(which(sapply(spectra_matrix, function(x) var(as.numeric(x), na.rm = TRUE) == 0)))
+if (length(constant_cols) > 0) {
+  spectra_matrix <- spectra_matrix %>% select(-all_of(constant_cols))
+}
+
+# Make numeric & drop rows with any NA to keep vegan happy
+spectra_matrix <- spectra_matrix %>%
+  mutate(across(everything(), as.numeric)) %>%
+  drop_na()
+
+if (nrow(spectra_matrix) > 1) {
+  meta_matrix <- interpolated %>%
+    distinct(SampleID, Machine) %>%
+    filter(SampleID %in% rownames(spectra_matrix)) %>%
+    column_to_rownames("SampleID")
+
+  if (length(unique(meta_matrix$Machine)) > 1) {
+    dist_mat  <- vegdist(spectra_matrix, method = "euclidean")
+    permanova <- adonis2(dist_mat ~ Machine, data = meta_matrix)
+    permanova_p <- permanova$`Pr(>F)`[1]
+    permanova_df <- tibble(SampleID = rownames(meta_matrix), permanova_p = permanova_p)
+  } else {
+    permanova_df <- tibble(SampleID = rownames(meta_matrix), permanova_p = NA_real_)
+  }
+} else {
+  permanova_df <- tibble(SampleID = character(), permanova_p = numeric())
+}
+
+# ------------------------
+# Merge all results
+# ------------------------
+summary_table <- metrics %>%
+  # join Wilcoxon by MatchID
+  left_join(wilcoxon_results, by = "MatchID") %>%
+  # join Bland-Altman by MatchID
+  left_join(bland_summary,     by = "MatchID") %>%
+  # PERMANOVA is at sample level; reduce to MatchID-level if possible
+  {
+    if (nrow(.) > 0 && nrow(permanova_df) > 0) {
+      mid_map <- interpolated %>% distinct(SampleID, MatchID)
+      perma_by_mid <- permanova_df %>%
+        left_join(mid_map, by = "SampleID") %>%
+        group_by(MatchID) %>%
+        summarise(permanova_p = mean(permanova_p, na.rm = TRUE), .groups = "drop")
+      left_join(., perma_by_mid, by = "MatchID")
+    } else .
+  } %>%
+  mutate(
+    significant_wilcoxon = ifelse(!is.na(p) & p < 0.05, "Yes", "No"),
+    high_ba_diff         = ifelse(!is.na(ba_mean_diff) & abs(ba_mean_diff) > 0.05, "Yes", "No")
+  )
+
+# ------------------------
+# Export CSVs
+# ------------------------
+write_csv(summary_table,  file.path(metadata_path, "summary_metrics.csv"))
+write_csv(metrics,        file.path(metadata_path, "cor_cv_cosine.csv"))
+write_csv(wilcoxon_results, file.path(metadata_path, "wilcoxon_results.csv"))
+write_csv(bland_summary,  file.path(metadata_path, "bland_altman.csv"))
+write_csv(permanova_df,   file.path(metadata_path, "permanova_results.csv"))
+
+# ------------------------
+# Visualizations
+# ------------------------
+
+# 1) Bland–Altman plot (saved to PNG)
+if (nrow(bland_altman) > 0) {
+  p_ba <- ggplot(bland_altman, aes(x = mean_vals, y = diff)) +
+    geom_point(alpha = 0.5) +
+    geom_hline(yintercept = 0) +
+    theme_minimal() +
+    ggtitle("Bland–Altman: Agilent vs Bruker")
+
+  ggsave(
+    filename = file.path(metadata_path, "bland_altman_plot.png"),
+    plot = p_ba, width = 7, height = 5, dpi = 300
+  )
+}
+
+# 2) PCA of interpolated spectra (samples x wavenumbers)
+if (nrow(spectra_matrix) >= 2 && ncol(spectra_matrix) >= 2) {
+  pca <- prcomp(spectra_matrix, center = TRUE, scale. = TRUE)
+  pca_df <- as_tibble(pca$x[, 1:2], rownames = "SampleID") %>%
+    left_join(
+      interpolated %>% distinct(SampleID, Machine),
+      by = "SampleID"
+    )
+
+  p_pca <- ggplot(pca_df, aes(x = PC1, y = PC2, color = Machine)) +
+    geom_point() +
+    theme_minimal() +
+    ggtitle("PCA of Interpolated Spectra")
+
+  ggsave(
+    filename = file.path(metadata_path, "pca_plot.png"),
+    plot = p_pca, width = 7, height = 5, dpi = 300
+  )
+}
+
+message("Done. CSVs and plots written to: ", metadata_path)
