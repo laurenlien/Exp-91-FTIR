@@ -42,7 +42,7 @@ Values are parsed to numeric; extra columns are ignored.
 
 ## Scripts
 
-### Script A — Cross-Instrument Comparison (KBr/LN-MCT-B vs ZnSe/TE-MCT-A, or Agilent vs Bruker)
+### Script 1 — Cross-Instrument Comparison (KBr/LN-MCT-B vs ZnSe/TE-MCT-A, or Agilent vs Bruker)
 **What it does**  
 Reads `.csv` spectra from Agilent (KKT/Raw) and Bruker (KKT/Raw); infers wavenumber & absorbance columns; cleans filenames into `SampleID` and `MatchID`; interpolates each spectrum to a common wavenumber grid; pairs Agilent ↔ Bruker per `MatchID`; then computes:
 - Pearson correlation (*r*)
@@ -60,7 +60,7 @@ Reads `.csv` spectra from Agilent (KKT/Raw) and Bruker (KKT/Raw); infers wavenum
 
 ---
 
-### Script B — Orientation test: Orientation-to-Orientation
+### Script 2 — Orientation test: Orientation-to-Orientation
 **What it does**  
 Within each specimen, compares **orientation** spectra for **point 1** only. It runs **twice**, once for KKT and once for Raw (no cross-mixing). For each `(specimen × data_type)` group, spectra are averaged at duplicate wavenumbers, interpolated to a per-group **union** grid (gentle end extrapolation), and compared pairwise across orientations. Metrics reported:
 - Pearson correlation (*r*)
