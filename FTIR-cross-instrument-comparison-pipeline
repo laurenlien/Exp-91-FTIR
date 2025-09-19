@@ -19,13 +19,13 @@ suppressPackageStartupMessages({
 # Paths
 # ------------------------
 folders <- list(
-  agilent_kkt = "folder location",
-  agilent_raw = "folder location",
-  bruker_kkt  = "folder location",
-  bruker_raw  = "folder location"
+  agilent_kkt = "#folder location",
+  agilent_raw = "#folder location",
+  bruker_kkt  = "#folder location",
+  bruker_raw  = "#folder location"
 )
 
-metadata_path <- "C:/Users/L.Lien/OneDrive - Universite de Liege/Documents/LLien PhD/Exp 91 stats"
+metadata_path <- "#path name"
 metadata_file <- file.path(metadata_path, "exp 91 metadata.xlsx")
 
 # ------------------------
@@ -60,7 +60,7 @@ cosine_vec <- function(x, y) {
 }
 
 # ------------------------
-# Read a folder of spectra (.xls), infer wavenumber/absorbance cols, and annotate
+# Read a folder of spectra (.csv), infer wavenumber/absorbance cols, and annotate
 # ------------------------
 read_spectrum_folder <- function(path, machine, type) {
   if (!dir.exists(path)) {
@@ -68,9 +68,9 @@ read_spectrum_folder <- function(path, machine, type) {
     return(tibble())
   }
 
-  files <- list.files(path, pattern = "\\.xls$", full.names = TRUE)
+  files <- list.files(path, pattern = "\\.csv$", full.names = TRUE)
   if (length(files) == 0) {
-    message("No .xls files found in: ", path)
+    message("No .csv files found in: ", path)
     return(tibble())
   }
 
@@ -313,42 +313,3 @@ write_csv(wilcoxon_results, file.path(metadata_path, "wilcoxon_results.csv"))
 write_csv(bland_summary,  file.path(metadata_path, "bland_altman.csv"))
 write_csv(permanova_df,   file.path(metadata_path, "permanova_results.csv"))
 
-# ------------------------
-# Visualizations
-# ------------------------
-
-# 1) Bland–Altman plot (saved to PNG)
-if (nrow(bland_altman) > 0) {
-  p_ba <- ggplot(bland_altman, aes(x = mean_vals, y = diff)) +
-    geom_point(alpha = 0.5) +
-    geom_hline(yintercept = 0) +
-    theme_minimal() +
-    ggtitle("Bland–Altman: Agilent vs Bruker")
-
-  ggsave(
-    filename = file.path(metadata_path, "bland_altman_plot.png"),
-    plot = p_ba, width = 7, height = 5, dpi = 300
-  )
-}
-
-# 2) PCA of interpolated spectra (samples x wavenumbers)
-if (nrow(spectra_matrix) >= 2 && ncol(spectra_matrix) >= 2) {
-  pca <- prcomp(spectra_matrix, center = TRUE, scale. = TRUE)
-  pca_df <- as_tibble(pca$x[, 1:2], rownames = "SampleID") %>%
-    left_join(
-      interpolated %>% distinct(SampleID, Machine),
-      by = "SampleID"
-    )
-
-  p_pca <- ggplot(pca_df, aes(x = PC1, y = PC2, color = Machine)) +
-    geom_point() +
-    theme_minimal() +
-    ggtitle("PCA of Interpolated Spectra")
-
-  ggsave(
-    filename = file.path(metadata_path, "pca_plot.png"),
-    plot = p_pca, width = 7, height = 5, dpi = 300
-  )
-}
-
-message("Done. CSVs and plots written to: ", metadata_path)
