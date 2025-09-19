@@ -1,0 +1,313 @@
+# =========================================================
+# FTIR Orientation Test Pipeline
+#  (ZnSe/TE-MCT-A [Bruker])
+# Author: Lauren Lien
+# Revised: 2025-09-19
+# =========================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(effsize)   # Cohen's d
+  library(readr)
+  library(janitor)
+  library(purrr)
+})
+options(readr.show_col_types = FALSE)
+
+# ---------------------------
+# 1) EDIT THESE PATHS
+# ---------------------------
+# Put the absolute path to your KKT CSV folder:
+dir_kkt <- "C:/path/to/your/KKT/csvs"
+
+# Put the absolute path to your Raw CSV folder:
+dir_raw <- "C:/path/to/your/Raw/csvs"
+
+# Optional: restrict to specific specimen numbers (e.g., c("11","26","28")).
+# Leave NULL to include all specimens automatically.
+specimen_filter <- NULL
+# specimen_filter <- c("11","26","28","29","30","32")
+
+# ---------------------------
+# Helpers
+# ---------------------------
+read_csv_auto <- function(file) {
+  df <- tryCatch(readr::read_csv(file), error = function(e) NULL)
+  if (!is.null(df) && ncol(df) > 1) return(df)
+  df <- tryCatch(readr::read_csv2(file), error = function(e) NULL)
+  if (!is.null(df) && ncol(df) > 1) return(df)
+  df <- tryCatch(readr::read_delim(file, delim = "\t"), error = function(e) NULL)
+  if (!is.null(df)) return(df)
+  NULL
+}
+
+find_col <- function(cols, pattern_vec) {
+  idx <- which(Reduce(`|`, lapply(pattern_vec, function(p) stringr::str_detect(cols, p))))
+  if (length(idx)) cols[idx[1]] else NA_character_
+}
+
+# Parse specimen (exp 91 NN), point, orientation, sample (optional) from filename
+parse_meta_from_filename <- function(fname) {
+  f <- tolower(fname)
+
+  specimen_num <- stringr::str_match(f, "\\bexp\\s*91\\s*(\\d+)\\b")[,2]
+  specimen     <- ifelse(is.na(specimen_num), NA_character_, paste("exp 91", specimen_num))
+
+  point_raw    <- stringr::str_match(f, "\\bpoint\\s*([0-9]+)\\b")[,2]
+  point        <- ifelse(is.na(point_raw), NA_integer_, as.integer(point_raw))
+
+  orient_raw   <- stringr::str_match(f, "\\borientation\\s*([0-9]+)\\b")[,2]
+  orientation  <- ifelse(is.na(orient_raw), NA_integer_, as.integer(orient_raw))
+
+  sample <- NA_character_
+  if (!is.na(point)) {
+    sample <- stringr::str_match(
+      f,
+      paste0("point\\s*", point, "\\s+(.+?)(?:\\s+orientation\\b|\\s+\\d+cm\\b|\\s+kkt\\b|\\s+raw\\b|$)")
+    )[,2]
+    if (!is.na(sample)) {
+      if (str_detect(sample, "vegetal\\s*fiber")) sample <- "vegetal fiber"
+      else if (str_detect(sample, "yellow\\s*spot")) sample <- "yellow spot"
+      else if (str_detect(sample, "black\\s*spot"))  sample <- "black spot"
+      else sample <- str_squish(sample)
+    } else {
+      sample <- "unknown"
+    }
+  }
+
+  tibble::tibble(
+    specimen = specimen,
+    specimen_num = specimen_num,
+    point = point,
+    orientation = orientation,
+    sample = sample
+  )
+}
+
+safe_cosine <- function(x, y) {
+  num <- sum(x * y, na.rm = TRUE)
+  den <- sqrt(sum(x^2, na.rm = TRUE)) * sqrt(sum(y^2, na.rm = TRUE))
+  if (!is.finite(den) || den == 0) return(NA_real_)
+  num / den
+}
+
+interp_to_grid <- function(wn, ab, grid_inc) {
+  ok <- is.finite(wn) & is.finite(ab)
+  wn <- wn[ok]; ab <- ab[ok]
+  if (length(wn) < 2) return(rep(NA_real_, length(grid_inc)))
+  ord <- order(wn)
+  approx(x = wn[ord], y = ab[ord], xout = grid_inc, rule = 2)$y  # gentle end extrapolation
+}
+
+# ---------------------------
+# Collect files separately and tag data_type by source list
+# ---------------------------
+files_kkt <- if (dir.exists(dir_kkt)) list.files(path = dir_kkt, pattern = "\\.csv$", full.names = TRUE, recursive = TRUE, ignore.case = TRUE) else character(0)
+files_raw <- if (dir.exists(dir_raw)) list.files(path = dir_raw, pattern = "\\.csv$", full.names = TRUE, recursive = TRUE, ignore.case = TRUE) else character(0)
+
+message("Found ", length(files_kkt), " KKT CSV(s) and ", length(files_raw), " Raw CSV(s).")
+if (length(files_kkt) + length(files_raw) == 0) stop("No files found. Edit dir_kkt and dir_raw to point to your folders.")
+
+read_and_parse <- function(path_full, data_type_label) {
+  df <- read_csv_auto(path_full)
+  if (is.null(df)) {
+    message("Failed to read (format): ", basename(path_full))
+    return(NULL)
+  }
+  df <- janitor::clean_names(df)
+  col_names <- names(df)
+
+  # robust header detection
+  wave_col <- find_col(col_names, c("^wavenumber", "^wavenumbers"))
+  sig_col  <- find_col(col_names, c("^absorbance", "^singlebeam", "^single_beam", "^interferogram"))
+  if (is.na(wave_col) || is.na(sig_col)) {
+    message("Skipping (no wavenumber/signal): ", basename(path_full), " | saw: ", paste(utils::head(col_names, 8), collapse = ", "))
+    return(NULL)
+  }
+
+  meta <- parse_meta_from_filename(basename(path_full))
+  if (is.na(meta$specimen) || is.na(meta$point) || is.na(meta$orientation)) {
+    message("Skipping (need specimen, point, orientation): ", basename(path_full))
+    return(NULL)
+  }
+
+  # Keep ONLY point 1
+  if (meta$point != 1) return(NULL)
+
+  # Optional specimen filter
+  if (!is.null(specimen_filter) && !(meta$specimen_num %in% specimen_filter)) return(NULL)
+
+  file_base <- basename(path_full)
+
+  df %>%
+    dplyr::rename(wavenumber = dplyr::all_of(wave_col),
+                  absorbance = dplyr::all_of(sig_col)) %>%
+    dplyr::mutate(
+      wavenumber  = suppressWarnings(readr::parse_number(as.character(wavenumber))),
+      absorbance  = suppressWarnings(readr::parse_number(as.character(absorbance))),
+      file        = file_base,
+      specimen    = meta$specimen,
+      specimen_num= meta$specimen_num,
+      orientation = meta$orientation,
+      sample      = meta$sample,
+      data_type   = data_type_label
+    ) %>%
+    dplyr::select(wavenumber, absorbance, file, specimen, specimen_num, orientation, sample, data_type)
+}
+
+spectra_kkt <- lapply(files_kkt, read_and_parse, data_type_label = "KKT")
+spectra_raw <- lapply(files_raw, read_and_parse, data_type_label = "Raw")
+
+spectra_all <- bind_rows(spectra_kkt, spectra_raw) %>%
+  tidyr::drop_na(wavenumber, absorbance)
+
+if (nrow(spectra_all) == 0) stop("No point-1 spectra after parsing (check filenames and headers).")
+
+# ---------------------------
+# Diagnostics
+# ---------------------------
+diag <- spectra_all %>%
+  distinct(specimen, data_type, orientation) %>%
+  count(specimen, data_type, name = "n_orientations") %>%
+  arrange(data_type, specimen)
+message("\nOrientations per (specimen × data_type):")
+print(diag)
+
+# ---------------------------
+# Collapse duplicates: average per (specimen, data_type, orientation, wavenumber)
+# ---------------------------
+collapsed <- spectra_all %>%
+  group_by(specimen, data_type, orientation, wavenumber) %>%
+  summarise(absorbance = mean(absorbance, na.rm = TRUE), .groups = "drop") %>%
+  mutate(id = paste(specimen, data_type, paste0("orientation_", orientation), sep = " | "))
+
+# ---------------------------
+# Build union grids per (specimen × data_type) and interpolate
+# ---------------------------
+grids <- collapsed %>%
+  group_by(specimen, data_type) %>%
+  summarise(
+    g_min = floor(min(wavenumber, na.rm = TRUE)),
+    g_max = ceiling(max(wavenumber, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  mutate(grid = purrr::map2(g_min, g_max, ~ seq(.x, .y, by = 2)))
+
+interp_long <- collapsed %>%
+  group_by(specimen, data_type, id) %>%
+  group_modify(function(df, key) {
+    grid_inc <- grids %>%
+      filter(specimen == key$specimen, data_type == key$data_type) %>%
+      pull(grid) %>% .[[1]]
+    if (length(grid_inc) < 2) return(tibble(wavenumber = numeric(0), value = numeric(0)))
+    tibble(
+      wavenumber = grid_inc,
+      value = interp_to_grid(df$wavenumber, df$absorbance, grid_inc)
+    )
+  }) %>%
+  ungroup()
+
+# Keep groups with ≥2 orientations
+ids_per_group <- collapsed %>%
+  distinct(specimen, data_type, id) %>%
+  count(specimen, data_type, name = "k_ids")
+
+interp_ok <- interp_long %>%
+  inner_join(collapsed %>% distinct(specimen, data_type, id), by = c("specimen","data_type","id")) %>%
+  inner_join(ids_per_group, by = c("specimen","data_type")) %>%
+  group_by(specimen, data_type) %>%
+  filter(k_ids >= 2) %>%
+  ungroup()
+
+if (nrow(interp_ok) == 0) {
+  stop("No (specimen × data_type) had ≥2 orientations for point 1. Check the diagnostics above.")
+}
+
+# ---------------------------
+# Pairwise across orientations within each (specimen × data_type)
+# ---------------------------
+pairwise_metrics <- list()
+groups <- interp_ok %>% distinct(specimen, data_type)
+
+for (i in seq_len(nrow(groups))) {
+  sp <- groups$specimen[i]
+  dt <- groups$data_type[i]
+
+  wide <- interp_ok %>%
+    filter(specimen == sp, data_type == dt) %>%
+    select(wavenumber, id, value) %>%
+    pivot_wider(names_from = id, values_from = value)
+
+  ids <- setdiff(colnames(wide), "wavenumber")
+  if (length(ids) < 2) next
+  combs <- combn(ids, 2, simplify = FALSE)
+
+  get_last <- function(id_str) sub(".*\\|\\s*", "", id_str)  # "orientation_X"
+
+  for (pair in combs) {
+    one <- pair[1]; two <- pair[2]
+    pair_df <- wide %>% select(wavenumber, all_of(c(one, two))) %>% drop_na(all_of(c(one, two)))
+    if (nrow(pair_df) < 2) next
+
+    x <- as.numeric(pair_df[[one]])
+    y <- as.numeric(pair_df[[two]])
+
+    diff <- x - y
+    sd_val     <- sd(diff)
+    mean_diff  <- mean(diff)
+    cv_val     <- ifelse(mean_diff == 0, NA_real_, sd_val / abs(mean_diff))
+    cor_val    <- suppressWarnings(cor(x, y, method = "pearson"))
+    cosine_val <- safe_cosine(x, y)
+    cohens_d   <- tryCatch(as.numeric(effsize::cohen.d(x, y, paired = TRUE)$estimate), error = function(e) NA_real_)
+    wilcox_p   <- tryCatch(stats::wilcox.test(x, y, paired = TRUE)$p.value, error = function(e) NA_real_)
+
+    pairwise_metrics[[length(pairwise_metrics)+1]] <- tibble::tibble(
+      specimen   = sp,
+      data_type  = dt,
+      orient_1   = get_last(one),
+      orient_2   = get_last(two),
+      n_points   = length(x),
+      sd         = sd_val,
+      mean_diff  = mean_diff,
+      cv         = cv_val,
+      pearson_r  = cor_val,
+      cosine_similarity = cosine_val,
+      cohens_d   = cohens_d,
+      wilcox_p   = wilcox_p
+    )
+  }
+}
+
+results_df <- bind_rows(pairwise_metrics)
+
+# ---------------------------
+# Write separate CSVs for KKT and Raw
+# ---------------------------
+if (nrow(results_df) == 0) {
+  stop("No pairwise metrics computed (need ≥2 orientations within a specimen × data_type).")
+}
+
+kkt_results <- results_df %>% dplyr::filter(tolower(data_type) == "kkt")
+raw_results <- results_df %>% dplyr::filter(tolower(data_type) == "raw")
+
+if (nrow(kkt_results) > 0) {
+  out_kkt <- file.path(dir_kkt, "spectral_pairwise_metrics_orientations_point1_KKT.csv")
+  readr::write_csv(kkt_results, out_kkt)
+  message("KKT results written to: ", out_kkt)
+} else {
+  message("No KKT results found.")
+}
+
+if (nrow(raw_results) > 0) {
+  out_raw <- file.path(dir_raw, "spectral_pairwise_metrics_orientations_point1_Raw.csv")
+  readr::write_csv(raw_results, out_raw)
+  message("Raw results written to: ", out_raw)
+} else {
+  message("No Raw results found.")
+}
+
+# Also print to console (optional)
+print(kkt_results)
+print(raw_results)
