@@ -1,0 +1,344 @@
+# =========================================================
+# FTIR Cross-Instrument Comparison Pipeline
+#  (KBr/LN-MCT-B [Agilent] vs ZnSe/TE-MCT-A [Bruker])
+# Author: Lauren Lien
+# Revised: 2025-09-19
+# =========================================================
+
+suppressPackageStartupMessages({
+  library(tidyverse)  # dplyr, tidyr, purrr, readr, tibble, stringr, ggplot2
+  library(janitor)
+  library(readxl)
+})
+options(readr.show_col_types = FALSE)
+
+# ------------------------
+# EDIT THESE PATHS
+# ------------------------
+# Base directory that holds all subfolders. Use forward slashes or file.path().
+# Example: base_dir <- "C:/Data/Exp_91_Repository"
+base_dir <- "PATH/TO/Exp_91_Data_Repository"
+
+# If your CSVs live in subfolders as shown below, you can keep these defaults and
+# just update base_dir. Otherwise, replace each with your exact folder.
+folders <- list(
+  agilent_kkt = file.path(base_dir, "Agilent KKT", "CSV"),
+  agilent_raw = file.path(base_dir, "Agilent raw", "CSV"),
+  bruker_kkt  = file.path(base_dir, "Bruker KKT", "CSV"),
+  bruker_raw  = file.path(base_dir, "Bruker raw", "CSV")
+)
+
+# Where to read metadata (if available) and write outputs.
+# The script auto-detects either .xlsx or .csv for the metadata file name below.
+metadata_path     <- base_dir
+metadata_basename <- "exp_91_metadata_instrument_comparison"  # do not include extension
+metadata_xlsx     <- file.path(metadata_path, paste0(metadata_basename, ".xlsx"))
+metadata_csv      <- file.path(metadata_path, paste0(metadata_basename, ".csv"))
+
+# ------------------------
+# Helpers
+# ------------------------
+
+# Build a canonical cross-machine key from filename stem:
+#   exp<exp>_s<sample>_p<point>[_o<orientation>]
+parse_match_from_stem <- function(stem) {
+  s <- stem %>%
+    tolower() %>%
+    str_replace_all("[_]+", " ") %>%
+    str_replace_all("\\s+", " ") %>%
+    str_trim() %>%
+    str_remove("^(a|b)\\s+") %>%             # drop leading machine letter if present
+    str_remove_all("\\b(kkt|sm|proc|processed)\\b") %>%
+    str_remove_all("\\b\\d+cm\\b") %>%
+    str_squish()
+
+  exp  <- str_match(s, "\\bexp\\s*(\\d+)\\b")[,2]
+  samp <- str_match(s, "\\bexp\\s*\\d+\\s*(\\d+)\\b")[,2]
+  pt   <- str_match(s, "\\bpoint\\s*(\\d+)\\b")[,2]
+  ori  <- str_match(s, "\\borientation\\s*(\\d+)\\b")[,2]
+
+  if (is.na(exp) || is.na(samp) || is.na(pt)) return(NA_character_)
+  id <- paste0("exp", exp, "_s", sprintf("%02d", as.integer(samp)), "_p", sprintf("%02d", as.integer(pt)))
+  if (!is.na(ori)) id <- paste0(id, "_o", sprintf("%02d", as.integer(ori)))
+  id
+}
+
+# Human-readable SampleID: "exp <exp> <sample>" [+ " orientation <n>"]
+build_sampleid_from_stem <- function(stem) {
+  s <- stem %>% tolower() %>% str_replace_all("[_]+", " ") %>% str_squish()
+  s <- s %>% str_remove("^(a|b)\\s+")
+  exp  <- str_match(s, "\\bexp\\s*(\\d+)\\b")[,2]
+  samp <- str_match(s, "\\bexp\\s*\\d+\\s*(\\d+)\\b")[,2]
+  ori  <- str_match(s, "\\borientation\\s*(\\d+)\\b")[,2]
+  if (is.na(exp) || is.na(samp)) return(NA_character_)
+  out <- paste("exp", exp, samp)
+  if (!is.na(ori)) out <- paste(out, "orientation", ori)
+  out
+}
+
+cosine_vec <- function(x, y) {
+  x <- as.numeric(x); y <- as.numeric(y)
+  num <- sum(x * y, na.rm = TRUE)
+  den <- sqrt(sum(x^2, na.rm = TRUE)) * sqrt(sum(y^2, na.rm = TRUE))
+  if (!is.finite(den) || den == 0) return(NA_real_)
+  num / den
+}
+
+# ---------- robust CSV reader helpers ----------
+read_csv_auto <- function(file) {
+  df <- tryCatch(readr::read_csv(file, show_col_types = FALSE), error = function(e) NULL)
+  if (!is.null(df) && ncol(df) > 1) return(df)
+  df <- tryCatch(readr::read_csv2(file, show_col_types = FALSE), error = function(e) NULL)
+  if (!is.null(df) && ncol(df) > 1) return(df)
+  df <- tryCatch(readr::read_delim(file, delim = "\t", show_col_types = FALSE), error = function(e) NULL)
+  if (!is.null(df)) return(df)
+  NULL
+}
+
+find_col <- function(cols, pattern_vec) {
+  idx <- which(Reduce(`|`, lapply(pattern_vec, function(p) stringr::str_detect(cols, p))))
+  if (length(idx)) cols[idx[1]] else NA_character_
+}
+
+# ------------------------
+# Reader: reads a folder of spectra and annotates
+#  (matches 'wavenumbers' and 'single_beam' & 'interferogram' too)
+# ------------------------
+read_spectrum_folder <- function(path, machine, type) {
+  if (!dir.exists(path)) {
+    message("Folder does not exist, skipping: ", path)
+    return(tibble())
+  }
+
+  # Case-insensitive listing for .csv / .CSV
+  files <- list.files(path, pattern = "\\.csv$", full.names = TRUE, recursive = TRUE, ignore.case = TRUE)
+  message(sprintf("[%s/%s] %d CSV(s) found in %s", machine, type, length(files), path))
+  if (length(files) > 0) message("  e.g.: ", paste(head(basename(files), 3), collapse = " | "))
+  if (length(files) == 0) return(tibble())
+
+  spectra <- lapply(files, function(file) {
+    df <- read_csv_auto(file)
+    if (is.null(df)) {
+      message("Failed to read (format): ", basename(file))
+      return(NULL)
+    }
+
+    df <- janitor::clean_names(df)
+    col_names <- names(df)
+
+    # Wavenumber variants (e.g., wavenumber, wavenumbers, wavenumber_cm_1)
+    wave_col <- find_col(col_names, c("^wavenumber", "^wavenumbers"))
+
+    # Signal variants: absorbance, singlebeam, single_beam, interferogram
+    abs_col  <- find_col(col_names, c("^absorbance", "^singlebeam", "^single_beam", "^interferogram"))
+
+    if (is.na(wave_col) || is.na(abs_col)) {
+      message("Skipping (no wavenumber/absorbance): ", basename(file),
+              " | saw: ", paste(utils::head(col_names, 8), collapse = ", "))
+      return(NULL)
+    }
+
+    stem <- tools::file_path_sans_ext(basename(file))
+    match_id <- parse_match_from_stem(stem)
+    if (is.na(match_id)) {
+      message("Skipping (couldn't parse MatchID): ", basename(file))
+      return(NULL)
+    }
+    sample_id <- build_sampleid_from_stem(stem)
+
+    df %>%
+      dplyr::rename(wavenumber = dplyr::all_of(wave_col),
+                    absorbance = dplyr::all_of(abs_col)) %>%
+      dplyr::mutate(
+        wavenumber = suppressWarnings(as.numeric(wavenumber)),
+        absorbance = suppressWarnings(as.numeric(absorbance)),
+        SampleID   = sample_id,
+        MatchID    = match_id,
+        Machine    = machine,
+        DataType   = type
+      )
+  })
+
+  dplyr::bind_rows(spectra)
+}
+
+# ------------------------
+# Load & combine spectra
+# ------------------------
+agilent_kkt <- read_spectrum_folder(folders$agilent_kkt, "Agilent", "KKT")
+agilent_raw <- read_spectrum_folder(folders$agilent_raw, "Agilent", "Raw")
+bruker_kkt  <- read_spectrum_folder(folders$bruker_kkt,  "Bruker",  "KKT")
+bruker_raw  <- read_spectrum_folder(folders$bruker_raw,  "Bruker",  "Raw")
+
+all_spectra <- dplyr::bind_rows(agilent_kkt, agilent_raw, bruker_kkt, bruker_raw) %>%
+  tidyr::drop_na(wavenumber, absorbance)
+
+if (nrow(all_spectra) == 0) {
+  stop("No spectra read. Check delimiters, headers (Wavenumber/Wavenumbers & Absorbance/SingleBeam/Interferogram), and file locations.")
+}
+
+# ------------------------
+# Diagnostics: counts by machine/type and overlaps
+# ------------------------
+message("\n=== Diagnostics ===")
+print(all_spectra %>% dplyr::count(Machine, DataType, name = "rows"))
+overlap_tbl <- all_spectra %>% dplyr::distinct(MatchID, Machine) %>%
+  tidyr::pivot_wider(names_from = Machine, values_from = Machine,
+                     values_fn = length, values_fill = 0)
+n_overlap <- sum(overlap_tbl$Agilent > 0 & overlap_tbl$Bruker > 0)
+message("Unique MatchIDs total: ", dplyr::n_distinct(all_spectra$MatchID))
+message("MatchIDs present in BOTH machines: ", n_overlap)
+if (n_overlap == 0) {
+  stop("No overlapping MatchIDs between Agilent and Bruker. Pairing would be empty. ",
+       "Please verify filename patterns so exp/sample/point (and orientation) align across instruments.")
+}
+
+# ------------------------
+# Load metadata (optional), normalize names
+# ------------------------
+read_metadata <- function(xlsx_path, csv_path) {
+  if (file.exists(xlsx_path)) {
+    message("Reading metadata: ", xlsx_path)
+    md <- readxl::read_xlsx(xlsx_path) %>% janitor::clean_names()
+  } else if (file.exists(csv_path)) {
+    message("Reading metadata: ", csv_path)
+    md <- readr::read_csv(csv_path, show_col_types = FALSE) %>% janitor::clean_names()
+  } else {
+    message("Metadata not found: ", xlsx_path, " or ", csv_path, " (continuing without).")
+    return(tibble())
+  }
+  if ("sampleid" %in% names(md) && !("sample_id" %in% names(md))) md <- dplyr::rename(md, sample_id = sampleid)
+  if ("SampleID" %in% names(md) && !("sample_id" %in% names(md))) md <- dplyr::rename(md, sample_id = SampleID)
+  if ("machine" %in% names(md)) md$machine <- tolower(md$machine)
+  if ("data_type" %in% names(md)) md$data_type <- tolower(md$data_type)
+  md
+}
+
+metadata <- read_metadata(metadata_xlsx, metadata_csv)
+
+spectra <- if (nrow(metadata) > 0 && ("sample_id" %in% names(metadata))) {
+  dplyr::left_join(all_spectra, metadata, by = c("SampleID" = "sample_id"))
+} else {
+  all_spectra
+}
+
+# ------------------------
+# Interpolation to a common grid (group_modify: don't return group keys)
+# ------------------------
+common_grid <- seq(4000, 650, by = -2)
+
+interpolate_spectra <- function(df, machine_label) {
+  if (nrow(df) == 0) return(tibble())
+  df %>%
+    dplyr::group_by(MatchID, SampleID) %>%
+    dplyr::group_modify(function(sample_df, key) {
+      sample_df <- sample_df %>%
+        dplyr::mutate(
+          wavenumber = readr::parse_number(as.character(wavenumber)),
+          absorbance = readr::parse_number(as.character(absorbance))
+        ) %>%
+        tidyr::drop_na(wavenumber, absorbance) %>%
+        dplyr::group_by(wavenumber) %>%
+        dplyr::summarise(absorbance = mean(absorbance, na.rm = TRUE), .groups = "drop") %>%
+        dplyr::arrange(wavenumber)
+
+      if (nrow(sample_df) < 2) return(tibble(wavenumber = numeric(0), absorbance = numeric(0), Machine = character(0)))
+
+      interp <- approx(x = sample_df$wavenumber,
+                       y = sample_df$absorbance,
+                       xout = common_grid,
+                       rule = 2)
+
+      tibble(
+        wavenumber = interp$x,
+        absorbance = interp$y,
+        Machine    = machine_label
+      )
+    }) %>%
+    dplyr::ungroup()
+}
+
+agilent_interp <- spectra %>% dplyr::filter(Machine == "Agilent") %>% interpolate_spectra("Agilent")
+bruker_interp  <- spectra %>% dplyr::filter(Machine == "Bruker")  %>% interpolate_spectra("Bruker")
+
+interpolated <- dplyr::bind_rows(agilent_interp, bruker_interp)
+
+if (nrow(interpolated) == 0) stop("Interpolation produced no rows. Check inputs.")
+
+# ------------------------
+# Pair and compute metrics
+# ------------------------
+paired_spectra <- interpolated %>%
+  tidyr::pivot_wider(names_from = Machine,
+                     values_from = absorbance,
+                     values_fn = mean,
+                     values_fill = NA) %>%
+  dplyr::mutate(
+    Agilent = as.numeric(Agilent),
+    Bruker  = as.numeric(Bruker)
+  ) %>%
+  tidyr::drop_na(Agilent, Bruker)
+
+if (nrow(paired_spectra) == 0) {
+  stop("Pairing created 0 rows. This means no MatchID had BOTH Agilent and Bruker spectra after interpolation. ",
+       "Check the diagnostics above and filename conventions.")
+}
+
+metrics <- paired_spectra %>%
+  dplyr::group_by(MatchID) %>%
+  dplyr::summarise(
+    valid_pairs = sum(!is.na(Agilent) & !is.na(Bruker)),
+    pearson     = if (valid_pairs > 1) cor(Agilent, Bruker, use = "complete.obs") else NA_real_,
+    cv_agilent  = if (valid_pairs > 1) sd(Agilent, na.rm = TRUE) / mean(Agilent, na.rm = TRUE) else NA_real_,
+    cv_bruker   = if (valid_pairs > 1) sd(Bruker,  na.rm = TRUE) / mean(Bruker,  na.rm = TRUE) else NA_real_,
+    cosine      = if (valid_pairs > 1) cosine_vec(Agilent, Bruker) else NA_real_,
+    .groups = "drop"
+  ) %>%
+  dplyr::filter(!is.na(pearson))
+
+# Wilcoxon and Bland–Altman
+wilcoxon_results <- paired_spectra %>%
+  dplyr::group_by(MatchID) %>%
+  dplyr::summarise(
+    p = tryCatch(stats::wilcox.test(Agilent, Bruker, paired = TRUE)$p.value,
+                 error = function(e) NA_real_)
+  )
+
+bland_altman <- paired_spectra %>%
+  dplyr::group_by(MatchID) %>%
+  dplyr::mutate(
+    diff      = Agilent - Bruker,
+    mean_vals = (Agilent + Bruker) / 2
+  ) %>%
+  dplyr::filter(!is.na(diff) & !is.na(mean_vals))
+
+bland_summary <- bland_altman %>%
+  dplyr::group_by(MatchID) %>%
+  dplyr::summarise(
+    ba_mean_diff = mean(diff, na.rm = TRUE),
+    ba_sd_diff   = sd(diff, na.rm = TRUE),
+    ba_upper     = ba_mean_diff + 1.96 * ba_sd_diff,
+    ba_lower     = ba_mean_diff - 1.96 * ba_sd_diff,
+    .groups = "drop"
+  )
+
+# ------------------------
+# Export
+# ------------------------
+readr::write_csv(metrics,          file.path(metadata_path, "cor_cv_cosine.csv"))
+readr::write_csv(wilcoxon_results, file.path(metadata_path, "wilcoxon_results.csv"))
+readr::write_csv(bland_summary,    file.path(metadata_path, "bland_altman.csv"))
+
+# Also a combined table for convenience
+summary_table <- metrics %>%
+  dplyr::left_join(wilcoxon_results, by = "MatchID") %>%
+  dplyr::left_join(bland_summary,     by = "MatchID") %>%
+  dplyr::mutate(
+    significant_wilcoxon = ifelse(!is.na(p) & p < 0.05, "Yes", "No"),
+    high_ba_diff         = ifelse(!is.na(ba_mean_diff) & abs(ba_mean_diff) > 0.05, "Yes", "No")
+  )
+
+readr::write_csv(summary_table,    file.path(metadata_path, "summary_metrics.csv"))
+
+message("\nDone. Outputs written to: ", metadata_path,
+        " (paths are generic—set base_dir and/or folder paths above).")
