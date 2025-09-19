@@ -3,8 +3,8 @@
 ## Overview
 This repository contains two R scripts used in the Exp. 91 project to assess FTIR spectral **reproducibility** and **cross-instrument comparability**. Both scripts read FTIR spectra provided as `.csv`, handle common header variations automatically, interpolate to align spectra, and write results back to `.csv` for downstream stats and figures.
 
-- **Script A — Cross-Instrument Comparison (KBr/LN-MCT-B vs ZnSe/TE-MCT-A):** Pairs like-for-like spectra, interpolates to a common grid, and computes agreement metrics (Pearson *r*, CV, cosine similarity, Wilcoxon signed-rank, Bland–Altman).
-- **Script B — Orientation test:** Within a specimen, compares **orientation-to-orientation** spectra **separately** for KKT and Raw datasets (no cross-mixing), with interpolation to a per-group grid and the same agreement metrics.
+- **Script 1 — Cross-Instrument Comparison (KBr/LN-MCT-B vs ZnSe/TE-MCT-A):** Pairs like-for-like spectra, interpolates to a common grid, and computes agreement metrics (Pearson *r*, CV, cosine similarity, Wilcoxon signed-rank, Bland–Altman).
+- **Script 2 — Orientation test:** Within a specimen, compares **orientation-to-orientation** spectra **separately** for KKT and Raw datasets (no cross-mixing), with interpolation to a per-group grid and the same agreement metrics.
 
 These tools underpin analyses for Lien et al. (in prep.), *FTIR Analysis of Experimental Adhesives: Investigating Spectral Reproducibility, Chemometric Approaches, and Archaeological Applications*.
 
