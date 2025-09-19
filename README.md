@@ -1,4 +1,4 @@
-# Exp. 91 — FTIR Analysis: Experimental Adhesives (R Scripts)
+# Exp. 91 FTIR Analysis: Experimental Adhesives (R Scripts)
 
 ## Overview
 This repository contains two R scripts used in the Exp. 91 project to assess FTIR spectral **reproducibility** and **cross-instrument comparability**. Both scripts read FTIR spectra provided as `.csv`, handle common header variations automatically, interpolate to align spectra, and write results back to `.csv` for downstream stats and figures.
