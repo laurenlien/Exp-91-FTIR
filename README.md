@@ -118,7 +118,9 @@ If you use these scripts, please cite:
 
 ## License & Copyright
 These scripts are available under the GPL-2 license
+
 Copyright 2025 ULiege
+
 [Author Lauren Lien <lauren.lien@uliege.be.>]
 
 ---
