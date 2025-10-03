@@ -116,7 +116,7 @@ If your workflow includes additional visualization or statistical steps (e.g., P
 If you use these scripts, please cite:  
 **Lien et al. (in preparation)**, *FTIR Analysis of Experimental Adhesives: Investigating Spectral Reproducibility, Chemometric Approaches, and Archaeological Applications.*
 
-## License and Copyright
+## License & Copyright
 These scripts are available under the GPL-2 license
 Copyright 2025 ULiege
 [Author Lauren Lien <lauren.lien@uliege.be.>]
