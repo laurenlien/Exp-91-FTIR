@@ -85,8 +85,8 @@ Within each specimen, compares **orientation** spectra for **point 1** only. It 
 2. Place your data under the folders described above (or point the scripts to your own paths).  
 3. Install packages (see below).  
 4. Open R / RStudio and run:
-   - Script A for cross-instrument comparisons  
-   - Script B for orientation comparisons (KKT and Raw exported separately)
+   - Script 1 for cross-instrument comparisons  
+   - Script 2 for orientation comparisons (KKT and Raw exported separately)
 
 Each script stops with a clear message if no eligible files are found or if parsing fails, and prints diagnostics (e.g., number of orientations per specimen).
 
