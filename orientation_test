@@ -1,8 +1,9 @@
 # =========================================================
 # FTIR Orientation Test Pipeline
 #  (ZnSe/TE-MCT-A [Bruker])
-# Author: Lauren Lien
-# Revised: 2025-09-19
+# Copyright 2025 ULiege
+# Author: Lauren Lien <lauren.lien@uliege.be>
+# Revised: 2025-10-03
 # =========================================================
 
 suppressPackageStartupMessages({
